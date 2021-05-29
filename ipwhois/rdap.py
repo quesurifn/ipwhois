@@ -22,7 +22,6 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from pprint import pprint
 from . import (ASN, Net, NetError, InvalidEntityContactObject, InvalidNetworkObject,
                InvalidEntityObject, HTTPLookupError)
 
@@ -920,9 +919,6 @@ class RDAP:
             for ent in response['entities']:
                 if ent['handle'] not in [results['entities'],
                                          excluded_entities]:
-
-                    pprint('ent')
-                    pprint(ent)
 
                     if 'vcardArray' not in ent and root_ent_check:
                         entity_object, roles = self._get_entity(
