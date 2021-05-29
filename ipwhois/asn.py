@@ -22,858 +22,500 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-import re
 import sys
-import copy
+import socket
+import dns.resolver
+import json
+from collections import namedtuple
 import logging
+from time import sleep
 
-from .exceptions import (NetError, ASNRegistryError, ASNParseError,
-                         ASNLookupError, HTTPLookupError, WhoisLookupError,
-                         WhoisRateLimitError, ASNOriginLookupError)
+# Import the dnspython rdtypes to fix the dynamic import problem when frozen.
+from .exceptions import (IPDefinedError, ASNLookupError, BlacklistError,
+                         WhoisLookupError, HTTPLookupError, HostLookupError,
+                         HTTPRateLimitError, WhoisRateLimitError)
+from .whois import RIR_WHOIS
+from .asn_origin import ASN_ORIGIN_WHOIS
+from .utils import ipv4_is_defined, ipv6_is_defined
 
-if sys.version_info >= (3, 3):  # pragma: no cover
-    from ipaddress import ip_network
-
-else:  # pragma: no cover
-    from ipaddr import IPNetwork as ip_network
+try:  # pragma: no cover
+    from urllib.request import (OpenerDirector,
+                                ProxyHandler,
+                                build_opener,
+                                Request,
+                                URLError,
+                                HTTPError)
+    from urllib.parse import urlencode
+except ImportError:  # pragma: no cover
+    from urllib2 import (OpenerDirector,
+                         ProxyHandler,
+                         build_opener,
+                         Request,
+                         URLError,
+                         HTTPError)
+    from urllib import urlencode
 
 log = logging.getLogger(__name__)
 
-BASE_NET = {
-    'cidr': None,
-    'description': None,
-    'maintainer': None,
-    'updated': None,
-    'source': None
-}
+# POSSIBLY UPDATE TO USE RDAP
+ARIN = 'http://whois.arin.net/rest/nets;q={0}?showDetails=true&showARIN=true'
 
-ASN_ORIGIN_WHOIS = {
-    'radb': {
-        'server': 'whois.radb.net',
-        'fields': {
-            'description': r'(descr):[^\S\n]+(?P<val>.+?)\n',
-            'maintainer': r'(mnt-by):[^\S\n]+(?P<val>.+?)\n',
-            'updated': r'(changed):[^\S\n]+(?P<val>.+?)\n',
-            'source': r'(source):[^\S\n]+(?P<val>.+?)\n',
-        }
-    },
-}
+CYMRU_WHOIS = 'whois.cymru.com'
 
-ASN_ORIGIN_HTTP = {
-    'radb': {
-        'url': 'http://www.radb.net/query',
-        'form_data_asn_field': 'keywords',
-        'form_data': {
-            'advanced_query': '1',
-            'query': 'Query',
-            # '-T option': 'inet-rtr',
-            'ip_option': '',
-            '-i': '1',
-            '-i option': 'origin'
-        },
-        'fields': {
-            'description': r'(descr):[^\S\n]+(?P<val>.+?)\n',
-            'maintainer': r'(mnt-by):[^\S\n]+(?P<val>.+?)\n',
-            'updated': r'(changed):[^\S\n]+(?P<val>.+?)\n',
-            'source': r'(source):[^\S\n]+(?P<val>.+?)\<',
-        }
-    },
+IPV4_DNS_ZONE = '{0}.origin.asn.cymru.com'
+
+IPV6_DNS_ZONE = '{0}.origin6.asn.cymru.com'
+
+BLACKLIST = [
+    'root.rwhois.net'
+]
+
+ORG_MAP = {
+    'ARIN': 'arin',
+    'VR-ARIN': 'arin',
+    'RIPE': 'ripencc',
+    'APNIC': 'apnic',
+    'LACNIC': 'lacnic',
+    'AFRINIC': 'afrinic',
+    'DNIC': 'arin'
 }
 
 
-class IPASN:
+class ASN:
     """
-    The class for parsing ASN data for an IP address.
+    The class for performing asn queries.
 
     Args:
-        net (:obj:`ipwhois.net.Net`): A ipwhois.net.Net object.
+        asn (:obj:`str`/:obj:`int`/:obj:`IPv4Address`/:obj:`IPv6Address`):
+            An IPv4 or IPv6 address
+        timeout (:obj:`int`): The default timeout for socket connections in
+            seconds. Defaults to 5.
+        proxy_opener (:obj:`urllib.request.OpenerDirector`): The request for
+            proxy support. Defaults to None.
 
     Raises:
-        NetError: The parameter provided is not an instance of
-            ipwhois.net.Net
+        IPDefinedError: The address provided is defined (does not need to be
+            resolved).
     """
 
-    def __init__(self, net):
+    def __init__(self, asn, timeout=5, proxy_opener=None):
 
-        from .net import (Net, ORG_MAP)
-        from .whois import RIR_WHOIS
+        # IPv4Address or IPv6Address
+        if isinstance(asn, int):
+            self.asn = asn
 
-        # ipwhois.net.Net validation
-        if isinstance(net, Net):
 
-            self._net = net
+        # Default timeout for socket connections.
+        self.timeout = timeout
+
+        self.dns_resolver = dns.resolver.Resolver()
+        self.dns_resolver.timeout = timeout
+        self.dns_resolver.lifetime = timeout
+
+        # Proxy opener.
+        if isinstance(proxy_opener, OpenerDirector):
+
+            self.opener = proxy_opener
 
         else:
+            handler = ProxyHandler()
+            self.opener = build_opener(handler)
 
-            raise NetError('The provided net parameter is not an instance of '
-                           'ipwhois.net.Net')
+        # IP address in string format for use in queries.
+        self.asn_str = self.asn.__str__()
 
-        self.org_map = ORG_MAP
-        self.rir_whois = RIR_WHOIS
 
-    def parse_fields_dns(self, response):
+    def get_whois(self, asn_registry='arin', retry_count=3, server=None,
+                  port=43, extra_blacklist=None):
         """
-        The function for parsing ASN fields from a dns response.
+        The function for retrieving whois or rwhois information for an IP
+        address via any port. Defaults to port 43/tcp (WHOIS).
 
         Args:
-            response (:obj:`str`): The response from the ASN dns server.
-
-        Returns:
-            dict: The ASN lookup results
-
-            ::
-
-                {
-                    'asn' (str) - The Autonomous System Number
-                    'asn_date' (str) - The ASN Allocation date
-                    'asn_registry' (str) - The assigned ASN registry
-                    'asn_cidr' (str) - The assigned ASN CIDR
-                    'asn_country_code' (str) - The assigned ASN country code
-                    'asn_description' (None) - Cannot retrieve with this
-                        method.
-                }
-
-        Raises:
-            ASNRegistryError: The ASN registry is not known.
-            ASNParseError: ASN parsing failed.
-        """
-
-        try:
-
-            temp = response.split('|')
-
-            # Parse out the ASN information.
-            ret = {'asn_registry': temp[3].strip(' \n')}
-
-            if ret['asn_registry'] not in self.rir_whois.keys():
-
-                raise ASNRegistryError(
-                    'ASN registry {0} is not known.'.format(
-                        ret['asn_registry'])
-                )
-
-            ret['asn'] = temp[0].strip(' "\n')
-            ret['asn_cidr'] = temp[1].strip(' \n')
-            ret['asn_country_code'] = temp[2].strip(' \n').upper()
-            ret['asn_date'] = temp[4].strip(' "\n')
-            ret['asn_description'] = None
-
-        except ASNRegistryError:
-
-            raise
-
-        except Exception as e:
-
-            raise ASNParseError('Parsing failed for "{0}" with exception: {1}.'
-                                ''.format(response, e)[:100])
-
-        return ret
-
-    def parse_fields_verbose_dns(self, response):
-        """
-        The function for parsing ASN fields from a verbose dns response.
-
-        Args:
-            response (:obj:`str`): The response from the ASN dns server.
-
-        Returns:
-            dict: The ASN lookup results
-
-            ::
-
-                {
-                    'asn' (str) - The Autonomous System Number
-                    'asn_date' (str) - The ASN Allocation date
-                    'asn_registry' (str) - The assigned ASN registry
-                    'asn_cidr' (None) - Cannot retrieve with this method.
-                    'asn_country_code' (str) - The assigned ASN country code
-                    'asn_description' (str) - The ASN description
-                }
-
-        Raises:
-            ASNRegistryError: The ASN registry is not known.
-            ASNParseError: ASN parsing failed.
-        """
-
-        try:
-
-            temp = response.split('|')
-
-            # Parse out the ASN information.
-            ret = {'asn_registry': temp[2].strip(' \n')}
-
-            if ret['asn_registry'] not in self.rir_whois.keys():
-
-                raise ASNRegistryError(
-                    'ASN registry {0} is not known.'.format(
-                        ret['asn_registry'])
-                )
-
-            ret['asn'] = temp[0].strip(' "\n')
-            ret['asn_cidr'] = None
-            ret['asn_country_code'] = temp[1].strip(' \n').upper()
-            ret['asn_date'] = temp[3].strip(' \n')
-            ret['asn_description'] = temp[4].strip(' "\n')
-
-        except ASNRegistryError:
-
-            raise
-
-        except Exception as e:
-
-            raise ASNParseError('Parsing failed for "{0}" with exception: {1}.'
-                                ''.format(response, e)[:100])
-
-        return ret
-
-    def parse_fields_whois(self, response):
-        """
-        The function for parsing ASN fields from a whois response.
-
-        Args:
-            response (:obj:`str`): The response from the ASN whois server.
-
-        Returns:
-            dict: The ASN lookup results
-
-            ::
-
-                {
-                    'asn' (str) - The Autonomous System Number
-                    'asn_date' (str) - The ASN Allocation date
-                    'asn_registry' (str) - The assigned ASN registry
-                    'asn_cidr' (str) - The assigned ASN CIDR
-                    'asn_country_code' (str) - The assigned ASN country code
-                    'asn_description' (str) - The ASN description
-                }
-
-        Raises:
-            ASNRegistryError: The ASN registry is not known.
-            ASNParseError: ASN parsing failed.
-        """
-
-        try:
-
-            temp = response.split('|')
-
-            # Parse out the ASN information.
-            ret = {'asn_registry': temp[4].strip(' \n')}
-
-            if ret['asn_registry'] not in self.rir_whois.keys():
-
-                raise ASNRegistryError(
-                    'ASN registry {0} is not known.'.format(
-                        ret['asn_registry'])
-                )
-
-            ret['asn'] = temp[0].strip(' \n')
-            ret['asn_cidr'] = temp[2].strip(' \n')
-            ret['asn_country_code'] = temp[3].strip(' \n').upper()
-            ret['asn_date'] = temp[5].strip(' \n')
-            ret['asn_description'] = temp[6].strip(' \n')
-
-        except ASNRegistryError:
-
-            raise
-
-        except Exception as e:
-
-            raise ASNParseError('Parsing failed for "{0}" with exception: {1}.'
-                                ''.format(response, e)[:100])
-
-        return ret
-
-    def parse_fields_http(self, response, extra_org_map=None):
-        """
-        The function for parsing ASN fields from a http response.
-
-        Args:
-            response (:obj:`str`): The response from the ASN http server.
-            extra_org_map (:obj:`dict`): Dictionary mapping org handles to
-                RIRs. This is for limited cases where ARIN REST (ASN fallback
-                HTTP lookup) does not show an RIR as the org handle e.g., DNIC
-                (which is now the built in ORG_MAP) e.g., {'DNIC': 'arin'}.
-                Valid RIR values are (note the case-sensitive - this is meant
-                to match the REST result): 'ARIN', 'RIPE', 'apnic', 'lacnic',
-                'afrinic'. Defaults to None.
-
-        Returns:
-            dict: The ASN lookup results
-
-            ::
-
-                {
-                    'asn' (None) - Cannot retrieve with this method.
-                    'asn_date' (None) - Cannot retrieve with this method.
-                    'asn_registry' (str) - The assigned ASN registry
-                    'asn_cidr' (None) - Cannot retrieve with this method.
-                    'asn_country_code' (None) - Cannot retrieve with this
-                        method.
-                    'asn_description' (None) - Cannot retrieve with this
-                        method.
-                }
-
-        Raises:
-            ASNRegistryError: The ASN registry is not known.
-            ASNParseError: ASN parsing failed.
-        """
-
-        # Set the org_map. Map the orgRef handle to an RIR.
-        org_map = self.org_map.copy()
-        try:
-
-            org_map.update(extra_org_map)
-
-        except (TypeError, ValueError, IndexError, KeyError):
-
-            pass
-
-        try:
-
-            asn_data = {
-                'asn_registry': None,
-                'asn': None,
-                'asn_cidr': None,
-                'asn_country_code': None,
-                'asn_date': None,
-                'asn_description': None
-            }
-
-            try:
-
-                net_list = response['nets']['net']
-
-                if not isinstance(net_list, list):
-                    net_list = [net_list]
-
-            except (KeyError, TypeError):
-
-                log.debug('No networks found')
-                net_list = []
-
-            for n in reversed(net_list):
-
-                try:
-
-                    asn_data['asn_registry'] = (
-                        org_map[n['orgRef']['@handle'].upper()]
-                    )
-
-                except KeyError as e:
-
-                    log.debug('Could not parse ASN registry via HTTP: '
-                              '{0}'.format(str(e)))
-                    continue
-
-                break
-
-            if not asn_data['asn_registry']:
-
-                log.debug('Could not parse ASN registry via HTTP')
-                raise ASNRegistryError('ASN registry lookup failed.')
-
-        except ASNRegistryError:
-
-            raise
-
-        except Exception as e:  # pragma: no cover
-
-            raise ASNParseError('Parsing failed for "{0}" with exception: {1}.'
-                                ''.format(response, e)[:100])
-
-        return asn_data
-
-    def lookup(self, inc_raw=False, retry_count=3, extra_org_map=None,
-               asn_methods=None, get_asn_description=True):
-        """
-        The wrapper function for retrieving and parsing ASN information for an
-        IP address.
-
-        Args:
-            inc_raw (:obj:`bool`): Whether to include the raw results in the
-                returned dictionary. Defaults to False.
+            asn_registry (:obj:`str`): The NIC to run the query against.
+                Defaults to 'arin'.
             retry_count (:obj:`int`): The number of times to retry in case
                 socket errors, timeouts, connection resets, etc. are
                 encountered. Defaults to 3.
-            extra_org_map (:obj:`dict`): Mapping org handles to RIRs. This is
-                for limited cases where ARIN REST (ASN fallback HTTP lookup)
-                does not show an RIR as the org handle e.g., DNIC (which is
-                now the built in ORG_MAP) e.g., {'DNIC': 'arin'}. Valid RIR
-                values are (note the case-sensitive - this is meant to match
-                the REST result): 'ARIN', 'RIPE', 'apnic', 'lacnic', 'afrinic'
-                Defaults to None.
-            asn_methods (:obj:`list`): ASN lookup types to attempt, in order.
-                If None, defaults to all: ['dns', 'whois', 'http'].
-            get_asn_description (:obj:`bool`): Whether to run an additional
-                query when pulling ASN information via dns, in order to get
-                the ASN description. Defaults to True.
+            server (:obj:`str`): An optional server to connect to. If
+                provided, asn_registry will be ignored.
+            port (:obj:`int`): The network port to connect on. Defaults to 43.
+            extra_blacklist (:obj:`list` of :obj:`str`): Blacklisted whois
+                servers in addition to the global BLACKLIST. Defaults to None.
 
         Returns:
-            dict: The ASN lookup results
-
-            ::
-
-                {
-                    'asn' (str) - The Autonomous System Number
-                    'asn_date' (str) - The ASN Allocation date
-                    'asn_registry' (str) - The assigned ASN registry
-                    'asn_cidr' (str) - The assigned ASN CIDR
-                    'asn_country_code' (str) - The assigned ASN country code
-                    'asn_description' (str) - The ASN description
-                    'raw' (str) - Raw ASN results if the inc_raw parameter is
-                        True.
-                }
+            str: The raw whois data.
 
         Raises:
-            ValueError: methods argument requires one of dns, whois, http.
-            ASNRegistryError: ASN registry does not match.
+            BlacklistError: Raised if the whois server provided is in the
+                global BLACKLIST or extra_blacklist.
+            WhoisLookupError: The whois lookup failed.
+            WhoisRateLimitError: The Whois request rate limited and retries
+                were exhausted.
         """
 
-        if asn_methods is None:
+        try:
 
-            lookups = ['dns', 'whois', 'http']
+            extra_bl = extra_blacklist if extra_blacklist else []
 
-        else:
+            if any(server in srv for srv in (BLACKLIST, extra_bl)):
+                raise BlacklistError(
+                    'The server {0} is blacklisted.'.format(server)
+                )
 
-            if {'dns', 'whois', 'http'}.isdisjoint(asn_methods):
+            if server is None:
+                server = RIR_WHOIS[asn_registry]['server']
 
-                raise ValueError('methods argument requires at least one of '
-                                 'dns, whois, http.')
+            # Create the connection for the whois query.
+            conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            conn.settimeout(self.timeout)
+            log.debug('WHOIS query for {0} at {1}:{2}'.format(
+                self.asn_str, server, port))
+            conn.connect((server, port))
 
-            lookups = asn_methods
+            # Prep the query.
+            query = self.asn_str + '\r\n'
+            if asn_registry == 'arin':
 
-        response = None
-        asn_data = None
-        dns_success = False
-        for index, lookup_method in enumerate(lookups):
+                query = 'n + {0}'.format(query)
 
-            if lookup_method == 'dns':
+            # Query the whois server, and store the results.
+            conn.send(query.encode())
 
-                try:
+            response = ''
+            while True:
 
-                    self._net.dns_resolver.lifetime = (
-                        self._net.dns_resolver.timeout * (
-                            retry_count and retry_count or 1
-                        )
+                d = conn.recv(4096).decode('ascii', 'ignore')
+
+                response += d
+
+                if not d:
+
+                    break
+
+            conn.close()
+
+            if 'Query rate limit exceeded' in response:  # pragma: no cover
+
+                if retry_count > 0:
+
+                    log.debug('WHOIS query rate limit exceeded. Waiting...')
+                    sleep(1)
+                    return self.get_whois(
+                        asn_registry=asn_registry, retry_count=retry_count-1,
+                        server=server, port=port,
+                        extra_blacklist=extra_blacklist
                     )
-                    response = self._net.get_asn_dns()
-                    asn_data_list = []
-                    for asn_entry in response:
 
-                        asn_data_list.append(self.parse_fields_dns(
-                            str(asn_entry)))
+                else:
 
-                    # Iterate through the parsed ASN results to find the
-                    # smallest CIDR
-                    asn_data = asn_data_list.pop(0)
-                    try:
+                    raise WhoisRateLimitError(
+                        'Whois lookup failed for {0}. Rate limit '
+                        'exceeded, wait and try again (possibly a '
+                        'temporary block).'.format(self.asn_str))
 
-                        prefix_len = ip_network(asn_data['asn_cidr']).prefixlen
-                        for asn_parsed in asn_data_list:
-                            prefix_len_comp = ip_network(
-                                asn_parsed['asn_cidr']).prefixlen
-                            if prefix_len_comp > prefix_len:
-                                asn_data = asn_parsed
-                                prefix_len = prefix_len_comp
+            elif ('error 501' in response or 'error 230' in response
+                  ):  # pragma: no cover
 
-                    except (KeyError, ValueError):  # pragma: no cover
+                log.debug('WHOIS query error: {0}'.format(response))
+                raise ValueError
 
-                        pass
+            return str(response)
 
-                    dns_success = True
-                    break
+        except (socket.timeout, socket.error) as e:
 
-                except (ASNLookupError, ASNRegistryError) as e:
+            log.debug('WHOIS query socket error: {0}'.format(e))
+            if retry_count > 0:
 
-                    log.debug('ASN DNS lookup failed: {0}'.format(e))
-                    pass
-
-            elif lookup_method == 'whois':
-
-                try:
-
-                    response = self._net.get_asn_whois(retry_count)
-                    asn_data = self.parse_fields_whois(
-                        response)  # pragma: no cover
-                    break
-
-                except (ASNLookupError, ASNRegistryError) as e:
-
-                    log.debug('ASN WHOIS lookup failed: {0}'.format(e))
-                    pass
-
-            elif lookup_method == 'http':
-
-                try:
-
-                    response = self._net.get_asn_http(
-                        retry_count=retry_count
-                    )
-                    asn_data = self.parse_fields_http(response,
-                                                       extra_org_map)
-                    break
-
-                except (ASNLookupError, ASNRegistryError) as e:
-
-                    log.debug('ASN HTTP lookup failed: {0}'.format(e))
-                    pass
-
-        if asn_data is None:
-
-            raise ASNRegistryError('ASN lookup failed with no more methods to '
-                                   'try.')
-
-        if get_asn_description and dns_success:
-
-            try:
-
-                response = self._net.get_asn_verbose_dns('AS{0}'.format(
-                    asn_data['asn']))
-                asn_verbose_data = self.parse_fields_verbose_dns(response)
-                asn_data['asn_description'] = asn_verbose_data[
-                    'asn_description']
-
-            except (ASNLookupError, ASNRegistryError) as e:  # pragma: no cover
-
-                log.debug('ASN DNS verbose lookup failed: {0}'.format(e))
-                pass
-
-        if inc_raw:
-
-            asn_data['raw'] = response
-
-        return asn_data
-
-
-class ASNOrigin:
-    """
-    The class for parsing ASN origin whois data
-
-    Args:
-        net (:obj:`ipwhois.net.Net`): A ipwhois.net.Net object.
-
-    Raises:
-        NetError: The parameter provided is not an instance of
-            ipwhois.net.Net
-    """
-
-    def __init__(self, net):
-
-        from .net import Net
-
-        # ipwhois.net.Net validation
-        if isinstance(net, Net):
-
-            self._net = net
-
-        else:
-
-            raise NetError('The provided net parameter is not an instance of '
-                           'ipwhois.net.Net')
-
-    def parse_fields(self, response, fields_dict, net_start=None,
-                     net_end=None, field_list=None):
-        """
-        The function for parsing ASN whois fields from a data input.
-
-        Args:
-            response (:obj:`str`): The response from the whois/rwhois server.
-            fields_dict (:obj:`dict`): Mapping of fields->regex search values.
-            net_start (:obj:`int`): The starting point of the network (if
-                parsing multiple networks). Defaults to None.
-            net_end (:obj:`int`): The ending point of the network (if parsing
-                multiple networks). Defaults to None.
-            field_list (:obj:`list`): If provided, a list of fields to parse:
-                ['description', 'maintainer', 'updated', 'source']
-                If None, defaults to all fields.
-
-        Returns:
-            dict: A dictionary of fields provided in fields_dict.
-        """
-
-        ret = {}
-
-        if not field_list:
-
-            field_list = ['description', 'maintainer', 'updated', 'source']
-
-        generate = ((field, pattern) for (field, pattern) in
-                    fields_dict.items() if field in field_list)
-
-        for field, pattern in generate:
-
-            pattern = re.compile(
-                str(pattern),
-                re.DOTALL
-            )
-
-            if net_start is not None:
-
-                match = pattern.finditer(response, net_end, net_start)
-
-            elif net_end is not None:
-
-                match = pattern.finditer(response, net_end)
+                log.debug('WHOIS query retrying (count: {0})'.format(
+                    str(retry_count)))
+                return self.get_whois(
+                    asn_registry=asn_registry, retry_count=retry_count-1,
+                    server=server, port=port, extra_blacklist=extra_blacklist
+                )
 
             else:
 
-                match = pattern.finditer(response)
+                raise WhoisLookupError(
+                    'WHOIS lookup failed for {0}.'.format(self.asn_str)
+                )
 
-            values = []
-            sub_section_end = None
-            for m in match:
+        except WhoisRateLimitError:  # pragma: no cover
 
-                if sub_section_end:
+            raise
 
-                    if sub_section_end != (m.start() - 1):
-                        break
+        except BlacklistError:
 
-                try:
+            raise
 
-                    values.append(m.group('val').strip())
+        except:  # pragma: no cover
 
-                except IndexError:  # pragma: no cover
+            raise WhoisLookupError(
+                'WHOIS lookup failed for {0}.'.format(self.asn_str)
+            )
 
-                    pass
-
-                sub_section_end = m.end()
-
-            if len(values) > 0:
-
-                value = None
-                try:
-
-                    value = values[0]
-
-                except ValueError as e:  # pragma: no cover
-
-                    log.debug('ASN origin Whois field parsing failed for {0}: '
-                              '{1}'.format(field, e))
-                    pass
-
-                ret[field] = value
-
-        return ret
-
-    def get_nets_radb(self, response, is_http=False):
+    def get_http_json(self, url=None, retry_count=3, rate_limit_timeout=120,
+                      headers=None):
         """
-        The function for parsing network blocks from ASN origin data.
+        The function for retrieving a json result via HTTP.
 
         Args:
-            response (:obj:`str`): The response from the RADB whois/http
-                server.
-            is_http (:obj:`bool`): If the query is RADB HTTP instead of whois,
-                set to True. Defaults to False.
-
-        Returns:
-            list: A list of network block dictionaries
-
-            ::
-
-                [{
-                    'cidr' (str) - The assigned CIDR
-                    'start' (int) - The index for the start of the parsed
-                        network block
-                    'end' (int) - The index for the end of the parsed network
-                        block
-                }]
-        """
-
-        nets = []
-
-        if is_http:
-            regex = r'route(?:6)?:[^\S\n]+(?P<val>.+?)\n'
-        else:
-            regex = r'^route(?:6)?:[^\S\n]+(?P<val>.+|.+)$'
-
-        # Iterate through all of the networks found, storing the CIDR value
-        # and the start and end positions.
-        for match in re.finditer(
-                regex,
-                response,
-                re.MULTILINE
-        ):
-
-            try:
-
-                net = copy.deepcopy(BASE_NET)
-                net['cidr'] = match.group(1).strip()
-                net['start'] = match.start()
-                net['end'] = match.end()
-                nets.append(net)
-
-            except ValueError:  # pragma: no cover
-
-                pass
-
-        return nets
-
-    def lookup(self, asn=None, inc_raw=False, retry_count=3, response=None,
-               field_list=None, asn_methods=None):
-        """
-        The function for retrieving and parsing ASN origin whois information
-        via port 43/tcp (WHOIS).
-
-        Args:
-            asn (:obj:`str`): The ASN (required).
-            inc_raw (:obj:`bool`): Whether to include the raw results in the
-                returned dictionary. Defaults to False.
+            url (:obj:`str`): The URL to retrieve (required).
             retry_count (:obj:`int`): The number of times to retry in case
                 socket errors, timeouts, connection resets, etc. are
                 encountered. Defaults to 3.
-            response (:obj:`str`): Optional response object, this bypasses the
-                Whois lookup. Defaults to None.
-            field_list (:obj:`list`): If provided, fields to parse:
-                ['description', 'maintainer', 'updated', 'source']
-                If None, defaults to all.
-            asn_methods (:obj:`list`): ASN lookup types to attempt, in order.
-                If None, defaults to all ['whois', 'http'].
+            rate_limit_timeout (:obj:`int`): The number of seconds to wait
+                before retrying when a rate limit notice is returned via
+                rdap+json or HTTP error 429. Defaults to 60.
+            headers (:obj:`dict`): The HTTP headers. The Accept header
+                defaults to 'application/rdap+json'.
 
         Returns:
-            dict: The ASN origin lookup results
-
-            ::
-
-                {
-                    'query' (str) - The Autonomous System Number
-                    'nets' (list) - Dictionaries containing network
-                        information which consists of the fields listed in the
-                        ASN_ORIGIN_WHOIS dictionary.
-                    'raw' (str) - Raw ASN origin whois results if the inc_raw
-                        parameter is True.
-                }
+            dict: The data in json format.
 
         Raises:
-            ValueError: methods argument requires one of whois, http.
-            ASNOriginLookupError: ASN origin lookup failed.
+            HTTPLookupError: The HTTP lookup failed.
+            HTTPRateLimitError: The HTTP request rate limited and retries
+                were exhausted.
         """
 
-        if asn[0:2] != 'AS':
+        if headers is None:
+            headers = {'Accept': 'application/rdap+json'}
 
-            asn = 'AS{0}'.format(asn)
+        try:
 
-        if asn_methods is None:
+            # Create the connection for the whois query.
+            log.debug('HTTP query for {0} at {1}'.format(
+                self.asn_str, url))
+            conn = Request(url, headers=headers)
+            data = self.opener.open(conn, timeout=self.timeout)
+            try:
+                d = json.loads(data.readall().decode('utf-8', 'ignore'))
+            except AttributeError:  # pragma: no cover
+                d = json.loads(data.read().decode('utf-8', 'ignore'))
 
-            lookups = ['whois', 'http']
+            try:
+                # Tests written but commented out. I do not want to send a
+                # flood of requests on every test.
+                for tmp in d['notices']:  # pragma: no cover
+                    if tmp['title'] == 'Rate Limit Notice':
+                        log.debug('RDAP query rate limit exceeded.')
 
-        else:
+                        if retry_count > 0:
+                            log.debug('Waiting {0} seconds...'.format(
+                                str(rate_limit_timeout)))
 
-            if {'whois', 'http'}.isdisjoint(asn_methods):
+                            sleep(rate_limit_timeout)
+                            return self.get_http_json(
+                                url=url, retry_count=retry_count-1,
+                                rate_limit_timeout=rate_limit_timeout,
+                                headers=headers
+                            )
+                        else:
+                            raise HTTPRateLimitError(
+                                'HTTP lookup failed for {0}. Rate limit '
+                                'exceeded, wait and try again (possibly a '
+                                'temporary block).'.format(url))
 
-                raise ValueError('methods argument requires at least one of '
-                                 'whois, http.')
+            except (KeyError, IndexError):  # pragma: no cover
 
-            lookups = asn_methods
+                pass
 
-        # Create the return dictionary.
-        results = {
-            'query': asn,
-            'nets': [],
-            'raw': None
-        }
+            return d
 
-        is_http = False
+        except HTTPError as e:  # pragma: no cover
 
-        # Only fetch the response if we haven't already.
-        if response is None:
+            # RIPE is producing this HTTP error rather than a JSON error.
+            if e.code == 429:
 
-            for index, lookup_method in enumerate(lookups):
+                log.debug('HTTP query rate limit exceeded.')
 
-                if lookup_method == 'whois':
+                if retry_count > 0:
+                    log.debug('Waiting {0} seconds...'.format(
+                        str(rate_limit_timeout)))
 
-                    try:
+                    sleep(rate_limit_timeout)
+                    return self.get_http_json(
+                        url=url, retry_count=retry_count - 1,
+                        rate_limit_timeout=rate_limit_timeout,
+                        headers=headers
+                    )
+                else:
+                    raise HTTPRateLimitError(
+                        'HTTP lookup failed for {0}. Rate limit '
+                        'exceeded, wait and try again (possibly a '
+                        'temporary block).'.format(url))
 
-                        log.debug('Response not given, perform ASN origin '
-                                  'WHOIS lookup for {0}'.format(asn))
+            else:
 
-                        # Retrieve the whois data.
-                        response = self._net.get_asn_origin_whois(
-                            asn=asn, retry_count=retry_count
-                        )
+                raise HTTPLookupError('HTTP lookup failed for {0} with error '
+                                      'code {1}.'.format(url, str(e.code)))
 
-                        break
+        except (URLError, socket.timeout, socket.error) as e:
 
-                    except (WhoisLookupError, WhoisRateLimitError) as e:
+            log.debug('HTTP query socket error: {0}'.format(e))
+            if retry_count > 0:
 
-                        log.debug('ASN origin WHOIS lookup failed: {0}'
-                                  ''.format(e))
-                        pass
+                log.debug('HTTP query retrying (count: {0})'.format(
+                    str(retry_count)))
 
-                elif lookup_method == 'http':
+                return self.get_http_json(
+                    url=url, retry_count=retry_count-1,
+                    rate_limit_timeout=rate_limit_timeout, headers=headers
+                )
 
-                    try:
+            else:
 
-                        log.debug('Response not given, perform ASN origin '
-                                  'HTTP lookup for: {0}'.format(asn))
+                raise HTTPLookupError('HTTP lookup failed for {0}.'.format(
+                    url))
 
-                        # tmp = ASN_ORIGIN_HTTP['radb']['form_data']
-                        # tmp[str(
-                        # ASN_ORIGIN_HTTP['radb']['form_data_asn_field']
-                        # )] = asn
-                        response = self._net.get_http_raw(
-                            url=('{0}?advanced_query=1&keywords={1}&-T+option'
-                                 '=&ip_option=&-i=1&-i+option=origin'
-                                 ).format(ASN_ORIGIN_HTTP['radb']['url'], asn),
-                            retry_count=retry_count,
-                            request_type='GET',
-                            # form_data=tmp
-                        )
-                        is_http = True   # pragma: no cover
+        except (HTTPLookupError, HTTPRateLimitError) as e:  # pragma: no cover
 
-                        break
+            raise e
 
-                    except HTTPLookupError as e:
+        except:  # pragma: no cover
 
-                        log.debug('ASN origin HTTP lookup failed: {0}'
-                                  ''.format(e))
-                        pass
+            raise HTTPLookupError('HTTP lookup failed for {0}.'.format(url))
 
-            if response is None:
+    def get_host(self, retry_count=3):
+        """
+        The function for retrieving host information for an IP address.
 
-                raise ASNOriginLookupError('ASN origin lookup failed with no '
-                                           'more methods to try.')
+        Args:
+            retry_count (:obj:`int`): The number of times to retry in case
+                socket errors, timeouts, connection resets, etc. are
+                encountered. Defaults to 3.
 
-        # If inc_raw parameter is True, add the response to return dictionary.
-        if inc_raw:
+        Returns:
+            namedtuple:
 
-            results['raw'] = response
+            :hostname (str): The hostname returned mapped to the given IP
+                address.
+            :aliaslist (list): Alternate names for the given IP address.
+            :ipaddrlist (list): IPv4/v6 addresses mapped to the same hostname.
 
-        nets = []
-        nets_response = self.get_nets_radb(response, is_http)
+        Raises:
+            HostLookupError: The host lookup failed.
+        """
 
-        nets.extend(nets_response)
+        try:
 
-        if is_http:   # pragma: no cover
-            fields = ASN_ORIGIN_HTTP
-        else:
-            fields = ASN_ORIGIN_WHOIS
+            default_timeout_set = False
+            if not socket.getdefaulttimeout():
 
-        # Iterate through all of the network sections and parse out the
-        # appropriate fields for each.
-        log.debug('Parsing ASN origin data')
+                socket.setdefaulttimeout(self.timeout)
+                default_timeout_set = True
 
-        for index, net in enumerate(nets):
+            log.debug('Host query for {0}'.format(self.asn_str))
+            ret = socket.gethostbyaddr(self.asn_str)
 
-            section_end = None
-            if index + 1 < len(nets):
+            if default_timeout_set:  # pragma: no cover
 
-                section_end = nets[index + 1]['start']
+                socket.setdefaulttimeout(None)
 
-            temp_net = self.parse_fields(
-                response,
-                fields['radb']['fields'],
-                section_end,
-                net['end'],
-                field_list
+            results = namedtuple('get_host_results', 'hostname, aliaslist, '
+                                                     'ipaddrlist')
+            return results(ret)
+
+        except (socket.timeout, socket.error) as e:
+
+            log.debug('Host query socket error: {0}'.format(e))
+            if retry_count > 0:
+
+                log.debug('Host query retrying (count: {0})'.format(
+                    str(retry_count)))
+
+                return self.get_host(retry_count - 1)
+
+            else:
+
+                raise HostLookupError(
+                    'Host lookup failed for {0}.'.format(self.asn_str)
+                )
+
+        except:  # pragma: no cover
+
+            raise HostLookupError(
+                'Host lookup failed for {0}.'.format(self.asn_str)
             )
 
-            # Merge the net dictionaries.
-            net.update(temp_net)
+    def get_http_raw(self, url=None, retry_count=3, headers=None,
+                     request_type='GET', form_data=None):
+        """
+        The function for retrieving a raw HTML result via HTTP.
 
-            # The start and end values are no longer needed.
-            del net['start'], net['end']
+        Args:
+            url (:obj:`str`): The URL to retrieve (required).
+            retry_count (:obj:`int`): The number of times to retry in case
+                socket errors, timeouts, connection resets, etc. are
+                encountered. Defaults to 3.
+            headers (:obj:`dict`): The HTTP headers. The Accept header
+                defaults to 'text/html'.
+            request_type (:obj:`str`): Request type 'GET' or 'POST'. Defaults
+                to 'GET'.
+            form_data (:obj:`dict`): Optional form POST data.
 
-        # Add the networks to the return dictionary.
-        results['nets'] = nets
+        Returns:
+            str: The raw data.
 
-        return results
+        Raises:
+            HTTPLookupError: The HTTP lookup failed.
+        """
+
+        if headers is None:
+            headers = {'Accept': 'text/html'}
+
+        enc_form_data = None
+        if form_data:
+            enc_form_data = urlencode(form_data)
+            try:
+                # Py 2 inspection will alert on the encoding arg, no harm done.
+                enc_form_data = bytes(enc_form_data, encoding='ascii')
+            except TypeError:  # pragma: no cover
+                pass
+
+        try:
+
+            # Create the connection for the HTTP query.
+            log.debug('HTTP query for {0} at {1}'.format(
+                self.asn_str, url))
+            try:
+                # Py 2 inspection alert bypassed by using kwargs dict.
+                conn = Request(url=url, data=enc_form_data, headers=headers,
+                               **{'method': request_type})
+            except TypeError:  # pragma: no cover
+                conn = Request(url=url, data=enc_form_data, headers=headers)
+            data = self.opener.open(conn, timeout=self.timeout)
+
+            try:
+                d = data.readall().decode('ascii', 'ignore')
+            except AttributeError:  # pragma: no cover
+                d = data.read().decode('ascii', 'ignore')
+
+            return str(d)
+
+        except (URLError, socket.timeout, socket.error) as e:
+
+            log.debug('HTTP query socket error: {0}'.format(e))
+            if retry_count > 0:
+
+                log.debug('HTTP query retrying (count: {0})'.format(
+                    str(retry_count)))
+
+                return self.get_http_raw(
+                    url=url, retry_count=retry_count - 1, headers=headers,
+                    request_type=request_type, form_data=form_data
+                )
+
+            else:
+
+                raise HTTPLookupError('HTTP lookup failed for {0}.'.format(
+                    url))
+
+        except HTTPLookupError as e:  # pragma: no cover
+
+            raise e
+
+        except Exception:  # pragma: no cover
+
+            raise HTTPLookupError('HTTP lookup failed for {0}.'.format(url))

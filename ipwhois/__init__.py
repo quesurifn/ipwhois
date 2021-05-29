@@ -24,6 +24,7 @@
 
 from .exceptions import *
 from .net import Net
+from .asn import ASN
 from .ipwhois import IPWhois
 
 __version__ = '1.2.0'

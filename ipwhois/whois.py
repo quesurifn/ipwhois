@@ -198,11 +198,16 @@ class Whois:
     def __init__(self, net):
 
         from .net import Net
+        from .asn import ASN
+
 
         # ipwhois.net.Net validation
         if isinstance(net, Net):
 
             self._net = net
+
+        elif isinstance(net, ASN):
+            self._asn = net
 
         else:
 
@@ -614,7 +619,7 @@ class Whois:
 
         # Create the return dictionary.
         results = {
-            'query': self._net.address_str,
+            'query': self._asn or self._net.address_str,
             'nets': [],
             'raw': None,
             'referral': None,
@@ -629,17 +634,27 @@ class Whois:
         if response is None or (not is_offline and
                                 asn_data['asn_registry'] != 'arin'):
 
-            log.debug('Response not given, perform WHOIS lookup for {0}'
-                      .format(self._net.address_str))
+            if hasattr(self, '_net'):
+                log.debug('Response not given, perform WHOIS lookup for {0}'
+                          .format(self._net.address_str))
 
-            # Retrieve the whois data.
-            response = self._net.get_whois(
-                asn_registry=asn_data['asn_registry'], retry_count=retry_count,
-                extra_blacklist=extra_blacklist
-            )
+                # Retrieve the whois data.
+                response = self._net.get_whois(
+                    asn_registry=asn_data['asn_registry'], retry_count=retry_count,
+                    extra_blacklist=extra_blacklist
+                )
+
+            else:
+                log.debug('Response not given, perform WHOIS lookup for {0}'
+                          .format(self._asn.address_str))
+
+                # Retrieve the whois data.
+                response = self._asn.get_whois(
+                    asn_registry=asn_data['asn_registry'], retry_count=retry_count,
+                    extra_blacklist=extra_blacklist
+                )
 
             if get_referral:
-
                 # Search for a referral server.
                 for match in re.finditer(
                     r'^ReferralServer:[^\S\n]+(.+:[0-9]+)$',
@@ -675,12 +690,18 @@ class Whois:
             response_ref = None
 
             try:
-
-                response_ref = self._net.get_whois(
-                    asn_registry='', retry_count=retry_count,
-                    server=referral_server, port=referral_port,
-                    extra_blacklist=extra_blacklist
-                )
+               if hasattr(self, '_net'):
+                    response_ref = self._net.get_whois(
+                        asn_registry='', retry_count=retry_count,
+                        server=referral_server, port=referral_port,
+                        extra_blacklist=extra_blacklist
+                    )
+               else:
+                   response_ref = self._asn.get_whois(
+                       asn_registry='', retry_count=retry_count,
+                       server=referral_server, port=referral_port,
+                       extra_blacklist=extra_blacklist
+                   )
 
             except (BlacklistError, WhoisLookupError):
 

@@ -22,8 +22,8 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from . import Net
-from .asn import IPASN
+from . import Net, ASN
+from .asn_origin import IPASN
 from .nir import NIRWhois
 import logging
 
@@ -45,24 +45,30 @@ class IPWhois:
     """
 
     def __init__(self, address, timeout=5, proxy_opener=None):
-
-        self.net = Net(
-            address=address, timeout=timeout, proxy_opener=proxy_opener
-        )
-        self.ipasn = IPASN(self.net)
-
-        self.address = self.net.address
-        self.timeout = self.net.timeout
-        self.address_str = self.net.address_str
-        self.version = self.net.version
-        self.reversed = self.net.reversed
-        self.dns_zone = self.net.dns_zone
+        if isinstance(address, int):
+            self.asn = ASN( address )
+            self.address_str = self.asn.asn_str
+        else:
+            self.net = Net( address=address, timeout=timeout, proxy_opener=proxy_opener )
+            self.ipasn = IPASN(self.net)
+            self.address = self.net.address
+            self.timeout = self.net.timeout
+            self.address_str = self.net.address_str
+            self.version = self.net.version
+            self.reversed = self.net.reversed
+            self.dns_zone = self.net.dns_zone
 
     def __repr__(self):
+        if hasattr(self, 'asn'):
 
-        return 'IPWhois({0}, {1}, {2})'.format(
-            self.address_str, str(self.timeout), repr(self.net.opener)
-        )
+            return 'IPWhois({0}, {1}, {2})'.format(
+                self.address_str, str(self.timeout), repr(self.asn.opener)
+            )
+
+        else:
+            return 'IPWhois({0}, {1}, {2})'.format(
+                self.address_str, str(self.timeout), repr(self.net.opener)
+            )
 
     def lookup_whois(self, inc_raw=False, retry_count=3, get_referral=False,
                      extra_blacklist=None, ignore_referral_errors=False,
@@ -286,10 +292,13 @@ class IPWhois:
         # Create the return dictionary.
         results = {'nir': None}
 
+
         asn_data = None
         response = None
-        if not bootstrap:
+        if hasattr(self, 'asn'):
+            bootstrap = True
 
+        if not bootstrap:
             # Retrieve the ASN information.
             log.debug('ASN lookup for {0}'.format(self.address_str))
             asn_data = self.ipasn.lookup(
@@ -302,7 +311,7 @@ class IPWhois:
             results.update(asn_data)
 
         # Retrieve the RDAP data and parse.
-        rdap = RDAP(self.net)
+        rdap = RDAP(self.asn or self.net)
         log.debug('RDAP lookup for {0}'.format(self.address_str))
         rdap_data = rdap.lookup(
             inc_raw=inc_raw, retry_count=retry_count, asn_data=asn_data,
@@ -315,8 +324,9 @@ class IPWhois:
         # Add the RDAP information to the return dictionary.
         results.update(rdap_data)
 
-        if inc_nir:
 
+
+        if inc_nir and isinstance(asn_data, dict):
             nir = None
             if 'JP' == asn_data['asn_country_code']:
                 nir = 'jpnic'

@@ -37,7 +37,7 @@ from .exceptions import (IPDefinedError, ASNLookupError, BlacklistError,
                          WhoisLookupError, HTTPLookupError, HostLookupError,
                          HTTPRateLimitError, WhoisRateLimitError)
 from .whois import RIR_WHOIS
-from .asn import ASN_ORIGIN_WHOIS
+from .asn_origin import ASN_ORIGIN_WHOIS
 from .utils import ipv4_is_defined, ipv6_is_defined
 
 if sys.version_info >= (3, 3):  # pragma: no cover

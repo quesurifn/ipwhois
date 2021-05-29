@@ -22,8 +22,10 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from . import (Net, NetError, InvalidEntityContactObject, InvalidNetworkObject,
+from pprint import pprint
+from . import (ASN, Net, NetError, InvalidEntityContactObject, InvalidNetworkObject,
                InvalidEntityObject, HTTPLookupError)
+
 from .utils import ipv4_lstrip_zeros, calculate_cidr, unique_everseen
 from .net import ip_address
 import logging
@@ -36,22 +38,27 @@ BOOTSTRAP_URL = 'http://rdap.arin.net/bootstrap'
 
 RIR_RDAP = {
     'arin': {
+        'asn_url': 'http://rdap.arin.net/registry/autnum/{0}',
         'ip_url': 'http://rdap.arin.net/registry/ip/{0}',
         'entity_url': 'http://rdap.arin.net/registry/entity/{0}'
     },
     'ripencc': {
+        'asn_url': 'http://rdap.db.ripe.net/autnum/{0}',
         'ip_url': 'http://rdap.db.ripe.net/ip/{0}',
         'entity_url': 'http://rdap.db.ripe.net/entity/{0}'
     },
     'apnic': {
+        'asn_url': 'http://rdap.apnic.net/autnum/{0}',
         'ip_url': 'http://rdap.apnic.net/ip/{0}',
         'entity_url': 'http://rdap.apnic.net/entity/{0}'
     },
     'lacnic': {
+        'asn_url': 'http://rdap.lacnic.net/rdap/autnum/{0}',
         'ip_url': 'http://rdap.lacnic.net/rdap/ip/{0}',
         'entity_url': 'http://rdap.lacnic.net/rdap/entity/{0}'
     },
     'afrinic': {
+        'asn_url': 'http://rdap.afrinic.net/rdap/autnum/{0}',
         'ip_url': 'http://rdap.afrinic.net/rdap/ip/{0}',
         'entity_url': 'http://rdap.afrinic.net/rdap/entity/{0}'
     }
@@ -272,7 +279,6 @@ class _RDAPCommon:
     """
 
     def __init__(self, json_result):
-
         if not isinstance(json_result, dict):
 
             raise ValueError
@@ -508,7 +514,6 @@ class _RDAPNetwork(_RDAPCommon):
                                        'object')
 
         try:
-
             self.vars['ip_version'] = self.json['ipVersion'].strip()
 
             # RDAP IPv4 addresses are padded to 3 digits per octet, remove
@@ -582,7 +587,6 @@ class _RDAPEntity(_RDAPCommon):
     """
 
     def __init__(self, json_result):
-
         try:
 
             _RDAPCommon.__init__(self, json_result)
@@ -684,6 +688,10 @@ class RDAP:
 
             self._net = net
 
+        elif isinstance(net, ASN):
+
+            self._asn = net
+
         else:
 
             raise NetError('The provided net parameter is not an instance of '
@@ -733,19 +741,29 @@ class RDAP:
             entity_url = str(entity_url).format(entity)
 
         try:
-
             # RDAP entity query
-            response = self._net.get_http_json(
-                url=entity_url, retry_count=retry_count,
-                rate_limit_timeout=rate_limit_timeout
-            )
+            if hasattr(self, '_asn'):
+
+                response = self._asn.get_http_json(
+                    url=entity_url, retry_count=retry_count,
+                    rate_limit_timeout=rate_limit_timeout
+                )
+            else:
+
+                response = self._net.get_http_json(
+                    url=entity_url, retry_count=retry_count,
+                    rate_limit_timeout=rate_limit_timeout
+                )
+
 
             # Parse the entity
             result_ent = _RDAPEntity(response)
             result_ent.parse()
             result = result_ent.vars
 
+
             result['roles'] = None
+
             try:
 
                 result['roles'] = roles[entity]
@@ -833,7 +851,7 @@ class RDAP:
 
         # Create the return dictionary.
         results = {
-            'query': self._net.address_str,
+            'query': self._asn.asn_str or self._net.address_str,
             'network': None,
             'entities': None,
             'objects': None,
@@ -841,34 +859,46 @@ class RDAP:
         }
 
         if bootstrap:
-
-            ip_url = '{0}/ip/{1}'.format(BOOTSTRAP_URL, self._net.address_str)
+            if hasattr(self, '_asn'):
+                ip_url = '{0}/autnum/{1}'.format(BOOTSTRAP_URL, self._asn.asn_str)
+            else:
+                ip_url = '{0}/ip/{1}'.format(BOOTSTRAP_URL, self._net.address_str)
 
         else:
 
-            ip_url = str(RIR_RDAP[asn_data['asn_registry']]['ip_url']).format(
-                self._net.address_str)
+            if hasattr(self, '_asn'):
+                ip_url = str(RIR_RDAP[asn_data['asn_registry']]['asn_url']).format(
+                    self._net.address_str)
+            else:
+                ip_url = str(RIR_RDAP[asn_data['asn_registry']]['ip_url']).format(
+                    self._net.address_str)
 
         # Only fetch the response if we haven't already.
         if response is None:
-
             log.debug('Response not given, perform RDAP lookup for {0}'.format(
                 ip_url))
 
-            # Retrieve the whois data.
-            response = self._net.get_http_json(
-                url=ip_url, retry_count=retry_count,
-                rate_limit_timeout=rate_limit_timeout
-            )
+            if hasattr(self, '_asn'):
+                response = self._asn.get_http_json(
+                    url=ip_url, retry_count=retry_count,
+                    rate_limit_timeout=rate_limit_timeout
+                )
+            else:
+                # Retrieve the whois data.
+                response = self._net.get_http_json(
+                    url=ip_url, retry_count=retry_count,
+                    rate_limit_timeout=rate_limit_timeout
+                )
 
         if inc_raw:
 
             results['raw'] = response
 
         log.debug('Parsing RDAP network object')
-        result_net = _RDAPNetwork(response)
-        result_net.parse()
-        results['network'] = result_net.vars
+        if hasattr(self, '_net'):
+            result_net = _RDAPNetwork(response)
+            result_net.parse()
+            results['network'] = result_net.vars
         results['entities'] = []
         results['objects'] = {}
         roles = {}
@@ -878,9 +908,11 @@ class RDAP:
         try:
 
             for ent in response['entities']:
-
                 if ent['handle'] not in [results['entities'],
                                          excluded_entities]:
+
+                    pprint('ent')
+                    pprint(ent)
 
                     if 'vcardArray' not in ent and root_ent_check:
                         entity_object, roles = self._get_entity(
@@ -937,6 +969,7 @@ class RDAP:
                         if ent not in (list(results['objects'].keys()) +
                                        list(new_objects.keys()) +
                                        excluded_entities):
+
 
                             entity_object, roles = self._get_entity(
                                 entity=ent,
