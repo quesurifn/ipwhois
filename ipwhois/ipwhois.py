@@ -310,8 +310,11 @@ class IPWhois:
             # Add the ASN information to the return dictionary.
             results.update(asn_data)
 
-        # Retrieve the RDAP data and parse.
-        rdap = RDAP(self.asn or self.net)
+        if hasattr(self, 'asn'):
+            rdap = RDAP(self.asn)
+        else:
+            rdap = RDAP(self.net)
+
         log.debug('RDAP lookup for {0}'.format(self.address_str))
         rdap_data = rdap.lookup(
             inc_raw=inc_raw, retry_count=retry_count, asn_data=asn_data,

@@ -850,13 +850,23 @@ class RDAP:
             excluded_entities = []
 
         # Create the return dictionary.
-        results = {
-            'query': self._asn.asn_str or self._net.address_str,
-            'network': None,
-            'entities': None,
-            'objects': None,
-            'raw': None
-        }
+        if hasattr(self, '_asn'):
+            results = {
+                'query': self._asn.asn_str,
+                'network': None,
+                'entities': None,
+                'objects': None,
+                'raw': None
+            }
+        else:
+            results = {
+                'query': self._net.address_str,
+                'network': None,
+                'entities': None,
+                'objects': None,
+                'raw': None
+            }
+
 
         if bootstrap:
             if hasattr(self, '_asn'):
