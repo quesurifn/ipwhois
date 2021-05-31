@@ -877,27 +877,3 @@ class ASNOrigin:
         results['nets'] = nets
 
         return results
-
-class ASN:
-    """
-    The class for parsing ASN whois data
-
-    Args:
-        net (:obj:`ipwhois.net.Net`): A ipwhois.net.Net object.
-
-    Raises:
-        NetError: The parameter provided is not an instance of
-            ipwhois.net.Net
-    """
-
-    def __init__(self, asn):
-
-        if type(asn, int):
-
-            self._asn = asn
-
-        else:
-
-            raise NetError('The provided net parameter is not an asn'
-                           '')
-
